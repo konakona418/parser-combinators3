@@ -1,29 +1,32 @@
 #include "parser_combinators2.hpp"
 
+#if __has_include(<mimalloc-new-delete.h>)
 #include <mimalloc-new-delete.h>
+#endif
+
 #include <benchmark/benchmark.h>
 
 #include <charconv>
-#include <map>
-#include <print>
-#include <meta>
 #include <chrono>
-#include <ranges>
+#include <fstream>
+#include <print>
+#include <string>
+#include <string_view>
 
 namespace pc = parser_combinators;
 
 struct json_value;
 using json_kv_pair = std::pair<std::string_view, json_value>;
-using json_object  = std::vector<json_kv_pair>;
+using json_object = std::vector<json_kv_pair>;
 using json_array = std::vector<json_value>;
 
 struct json_value {
-    pc::details::static_variant<
-        std::nullptr_t, 
-        bool, 
-        double, 
-        std::string_view, 
-        json_array, 
+    pc::detail::static_variant<
+        std::nullptr_t,
+        bool,
+        double,
+        std::string_view,
+        json_array,
         json_object
     > data;
 
@@ -49,11 +52,11 @@ struct json_value {
 // lexeme parser that skips surrounding whitespace
 // P is a detail::parser_wrapper
 template <auto P>
-constexpr auto lexeme = 
-    pc::dsl::combine<{
-        pc::dsl::whitespace().many().discard(), // use many to skip zero or more whitespace
-        P,                                      // use the parser P
-        pc::dsl::whitespace().many().discard(), // use discard to drop the result (don't map into result tuple/struct)
+constexpr auto lexeme =
+    pc::dsl::seq<{
+        pc::dsl::whitespace().many().discard(), // skip zero or more whitespace
+        P,                                      // the parser P
+        pc::dsl::whitespace().many().discard(), // drop the result
     }>();
 
 // symbol parsers for JSON syntax
@@ -68,24 +71,23 @@ constexpr auto comma = lexeme<pc::dsl::symbol<",">()>;
 
 // helper parser to parse sequences separated by a specific separator
 template <auto Sep>
-consteval auto sepby(auto P) { 
-    return pc::dsl::combine({ // combine first element and rest
-        P,                    // first element
-        (pc::dsl::combine({   // combine separator and element
-            Sep.discard(),    // separator
-            P,                // element
-        }).many()),           // takes zero or more
-    }) | pc::dsl::fmap<[](auto&& first, auto&& rest) {
-        // we use fmap to transform the result into a vector
-        // note that the type of rest is std::vector<std::tuple<element_type>>
-        // this is because each element is wrapped in a tuple due to combine,
-        // and the Sep is discarded, so we just get<0> to extract the element
-        // if you want to map the result tuple to a specific type, use fmap_struct
+consteval auto sepby(auto P) {
+    auto tail = (pc::dsl::seq({
+            Sep.discard(),
+            P,
+        }) | pc::dsl::map<[](auto&& element) {
+            return std::forward<decltype(element)>(element);
+        }>).many();
+
+    return pc::dsl::seq({
+        P,
+        tail,
+    }) | pc::dsl::map<[](auto&& first, auto&& rest) {
         using T = std::decay_t<decltype(first)>;
         std::vector<T> result;
-        result.push_back((std::move(first)));
+        result.push_back(std::forward<decltype(first)>(first));
         for (auto&& val : rest) {
-            result.push_back(std::move(std::get<0>(val)));
+            result.push_back(std::forward<decltype(val)>(val));
         }
         return result;
     }>;
@@ -93,14 +95,13 @@ consteval auto sepby(auto P) {
 
 // the main JSON parser
 // as JSON is recursive, we use a Y-combinator via dsl::lazy
-// and the recursive self (an detail::parser_wrapper) is passed as an argument to the lambda
 constexpr auto json_parser = pc::dsl::lazy<[](auto self) {
     // parse JSON arrays
-    auto array = pc::dsl::combine({
+    auto array = pc::dsl::seq({
         lbracket.discard(),
-        sepby<comma>(self).optional(), // use optional to allow empty arrays
+        sepby<comma>(self).optional(),
         rbracket.discard(),
-    }) | pc::dsl::fmap<[](auto&& opt) -> json_value {
+    }) | pc::dsl::map<[](auto&& opt) -> json_value {
         if (opt) {
             return json_value{std::move(*opt)};
         } else {
@@ -109,43 +110,40 @@ constexpr auto json_parser = pc::dsl::lazy<[](auto self) {
     }>;
 
     // string and numeric literals
-    auto string_lit = pc::dsl::combine({
+    auto string_lit = pc::dsl::seq({
         pc::dsl::symbol<"\"">().discard(),
-        pc::dsl::alphanumeric().many().collect(),
+        pc::dsl::alphanumeric().many().recognize(),
         pc::dsl::symbol<"\"">().discard(),
-    }) | pc::dsl::fmap<[](std::string_view s) -> json_value {
+    }) | pc::dsl::map<[](std::string_view s) -> json_value {
         return s;
     }>;
 
-    auto numeric_lit = pc::dsl::combine({
+    auto numeric_lit = pc::dsl::seq({
         pc::dsl::symbol<"-">().optional().discard(), // optional minus sign
-        pc::dsl::numeric().many().collect(),
-        pc::dsl::combine({
+        pc::dsl::numeric().many().recognize(),
+        pc::dsl::seq({
             pc::dsl::symbol<".">().discard(), // decimal point
-            pc::dsl::numeric().many().collect(),
+            pc::dsl::numeric().many().recognize(),
         }).optional(), // optional fractional part
-    }).collect().guard<pc::preds::not_empty>() | pc::dsl::fmap<[](std::string_view s) -> json_value {
-        // the collect() will just ignore all underlying structures and produce a single string_view
-        // and then we use guard to ensure it's not empty, or it will break std::stod
-        // finally, we convert to double
+    }).recognize().guard<pc::preds::not_empty>() | pc::dsl::map<[](std::string_view s) -> json_value {
         double val;
         std::from_chars(s.data(), s.data() + s.size(), val);
         return val;
     }>;
 
-    auto kwpair = pc::dsl::combine({
+    auto kwpair = pc::dsl::seq({
         string_lit,
-        colon.commit().discard(), // commit to avoid backtracking after colon
+        colon.cut().discard(), // cut to avoid backtracking after colon
         self,
-    }) | pc::dsl::fmap<[](auto&& key_val, auto&& value) {
+    }) | pc::dsl::map<[](auto&& key_val, auto&& value) {
         return std::make_pair(key_val.data.template get<std::string_view>(), std::move(value));
     }>;
 
-    auto object = pc::dsl::combine({
+    auto object = pc::dsl::seq({
         lbrace.discard(),
         sepby<comma>(kwpair).optional(),
         rbrace.discard(),
-    }) | pc::dsl::fmap<[](auto&& opt) -> json_value {
+    }) | pc::dsl::map<[](auto&& opt) -> json_value {
         if (opt) {
             return json_object{std::move(*opt)};
         } else {
@@ -159,19 +157,16 @@ constexpr auto json_parser = pc::dsl::lazy<[](auto self) {
         array,
         string_lit,
         numeric_lit,
-        pc::dsl::symbol<"true">()  | pc::dsl::fmap<[](...) -> json_value { return true; }>,
-        pc::dsl::symbol<"false">() | pc::dsl::fmap<[](...) -> json_value { return false; }>,
-        pc::dsl::symbol<"null">()  | pc::dsl::fmap<[](...) -> json_value { return nullptr; }>,
-    }) | pc::dsl::fmap<[](auto&& v) -> json_value {
-        // choice() produces a variant (though all the inner types are json_value already)
-        // we need to flatten it into json_value
-        return v.visit([](auto&& inner_val) -> json_value {
-            return (std::move(inner_val));
+        pc::dsl::symbol<"true">()  | pc::dsl::map<[](...) -> json_value { return true; }>,
+        pc::dsl::symbol<"false">() | pc::dsl::map<[](...) -> json_value { return false; }>,
+        pc::dsl::symbol<"null">()  | pc::dsl::map<[](...) -> json_value { return nullptr; }>,
+    }) | pc::dsl::map<[](auto&& v) -> json_value {
+        return std::forward<decltype(v)>(v).visit([](auto&& inner_val) -> json_value {
+            return std::move(inner_val);
         });
     }>;
 }>.fix<json_value>();
 
-#include <fstream>
 std::string read_file_to_string(const std::string& filepath) {
     std::ifstream file(filepath, std::ios::binary);
     if (!file) {
@@ -185,6 +180,7 @@ std::string read_file_to_string(const std::string& filepath) {
     return content;
 }
 
+#ifdef _WIN32
 extern "C" {
     using HANDLE = void*;
     using DWORD_PTR = unsigned __int64;
@@ -196,24 +192,32 @@ extern "C" {
     __declspec(dllimport) BOOL __stdcall SetPriorityClass(HANDLE hProcess, unsigned long dwPriorityClass);
 }
 
-constexpr unsigned long REALTIME_PRIORITY_CLASS = 0x00000100;
-constexpr unsigned long HIGH_PRIORITY_CLASS     = 0x00000080;
+constexpr unsigned long HIGH_PRIORITY_CLASS = 0x00000080;
+#endif
 
 void SetAffinity(const benchmark::State& state) {
+#ifdef _WIN32
     HANDLE thread = GetCurrentThread();
     SetThreadAffinityMask(thread, 1); // bind to CPU 0
 
     HANDLE process = GetCurrentProcess();
     SetPriorityClass(process, HIGH_PRIORITY_CLASS);
+#else
+    (void)state;
+#endif
 }
 
 auto parse_context = pc::context();
 
-static void BM_JsonParse_Win(benchmark::State& state) {
+static void BM_JsonParse(benchmark::State& state) {
     static std::string content = [] {
-        auto str = read_file_to_string("test_large.json");
-        return str;
+        return read_file_to_string("test_large.json");
     }();
+
+    if (content.empty()) {
+        state.SkipWithError("test_large.json not found");
+        return;
+    }
 
     for (auto _ : state) {
         auto result = pc::parser<json_parser>::parse(content, parse_context);
@@ -227,7 +231,7 @@ static void BM_JsonParse_Win(benchmark::State& state) {
     state.SetBytesProcessed(state.iterations() * content.size());
 }
 
-BENCHMARK(BM_JsonParse_Win)
+BENCHMARK(BM_JsonParse)
     ->Threads(1)
     ->Setup(SetAffinity)
     ->Unit(benchmark::kMillisecond)

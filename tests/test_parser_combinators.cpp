@@ -6,6 +6,7 @@
 #include "parser_combinators2.hpp"
 
 #include <cassert>
+#include <cmath>
 #include <print>
 #include <string>
 #include <string_view>
@@ -294,6 +295,233 @@ static void test_non_trivial_values() {
     CHECK(joined == "first+second");
 }
 
+// ---------------------------------------------------------------------------
+// satisfy / char / any_char / eof
+// ---------------------------------------------------------------------------
+
+static void test_satisfy_char_eof() {
+    constexpr auto vowel = pc::dsl::satisfy<[](char c) {
+        return c == 'a' || c == 'e' || c == 'i' || c == 'o' || c == 'u';
+    }>();
+    {
+        auto ctx = pc::context();
+        auto r = pc::parser<vowel>::parse("e", ctx);
+        CHECK(r.success);
+        CHECK(r.parsed == 'e');
+    }
+    {
+        auto ctx = pc::context();
+        CHECK(!pc::parser<vowel>::parse("z", ctx).success);
+    }
+    {
+        auto ctx = pc::context();
+        CHECK(pc::parser<vowel>::parse("z", ctx).committed == false);
+    }
+
+    constexpr auto x = pc::dsl::char_<'x'>();
+    {
+        auto ctx = pc::context();
+        CHECK(pc::parser<x>::parse("xyz", ctx).parsed == 'x');
+    }
+
+    constexpr auto anyc = pc::dsl::any_char();
+    {
+        auto ctx = pc::context();
+        CHECK(pc::parser<anyc>::parse("Z", ctx).parsed == 'Z');
+    }
+
+    constexpr auto end = pc::dsl::eof();
+    {
+        auto ctx = pc::context();
+        CHECK(pc::parser<end>::parse("", ctx).success);
+    }
+    {
+        auto ctx = pc::context();
+        auto r = pc::parser<end>::parse("x", ctx);
+        CHECK(!r.success);
+        CHECK(!r.committed);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// many1 / count
+// ---------------------------------------------------------------------------
+
+static void test_many1_count() {
+    constexpr auto digits = pc::dsl::numeric().many1().recognize();
+    {
+        auto ctx = pc::context();
+        auto r = pc::parser<digits>::parse("123a", ctx);
+        CHECK(r.success);
+        CHECK(r.parsed == "123");
+    }
+    {
+        auto ctx = pc::context();
+        auto r = pc::parser<digits>::parse("a", ctx);
+        CHECK(!r.success);
+        CHECK(!r.committed);
+    }
+
+    constexpr auto three = pc::dsl::any_char().count<3>().recognize();
+    {
+        auto ctx = pc::context();
+        auto r = pc::parser<three>::parse("abcd", ctx);
+        CHECK(r.success);
+        CHECK(r.parsed == "abc");
+    }
+    {
+        auto ctx = pc::context();
+        auto r = pc::parser<three>::parse("ab", ctx);
+        CHECK(!r.success);
+        CHECK(r.committed);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// sep_by / sep_by1 / between
+// ---------------------------------------------------------------------------
+
+static void test_sep_by_between() {
+    constexpr auto comma = pc::dsl::char_<','>();
+    constexpr auto nums = pc::dsl::numeric().many1().recognize().sep_by(comma);
+    {
+        auto ctx = pc::context();
+        auto r = pc::parser<nums>::parse("1,23,4", ctx);
+        CHECK(r.success);
+        CHECK(r.parsed.size() == 3);
+        CHECK(r.parsed[0] == "1");
+        CHECK(r.parsed[1] == "23");
+        CHECK(r.parsed[2] == "4");
+        CHECK(r.remaining.empty());
+    }
+    {
+        auto ctx = pc::context();
+        auto r = pc::parser<nums>::parse("", ctx);
+        CHECK(r.success);
+        CHECK(r.parsed.empty());
+    }
+    {
+        // trailing separator is a consumed failure
+        auto ctx = pc::context();
+        auto r = pc::parser<nums>::parse("1,", ctx);
+        CHECK(!r.success);
+        CHECK(r.committed);
+    }
+
+    constexpr auto nums1 = pc::dsl::numeric().many1().recognize().sep_by1(comma);
+    {
+        auto ctx = pc::context();
+        CHECK(!pc::parser<nums1>::parse("", ctx).success);
+    }
+
+    constexpr auto bracketed =
+        pc::dsl::between(pc::dsl::char_<'['>(), pc::dsl::char_<']'>(), nums);
+    {
+        auto ctx = pc::context();
+        auto r = pc::parser<bracketed>::parse("[1,2]", ctx);
+        CHECK(r.success);
+        CHECK(r.parsed.size() == 2);
+        CHECK(r.remaining.empty());
+    }
+}
+
+// ---------------------------------------------------------------------------
+// look_ahead / not_followed_by
+// ---------------------------------------------------------------------------
+
+static void test_look_ahead_not() {
+    constexpr auto la = pc::dsl::symbol<"ab">().look_ahead();
+    {
+        auto ctx = pc::context();
+        auto r = pc::parser<la>::parse("abc", ctx);
+        CHECK(r.success);
+        CHECK(r.remaining == "abc"); // nothing consumed
+    }
+
+    constexpr auto not_x = pc::dsl::char_<'x'>().not_followed_by();
+    {
+        auto ctx = pc::context();
+        auto r = pc::parser<not_x>::parse("y", ctx);
+        CHECK(r.success);
+        CHECK(r.remaining == "y");
+    }
+    {
+        auto ctx = pc::context();
+        CHECK(!pc::parser<not_x>::parse("x", ctx).success);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// attempt (inverse of cut)
+// ---------------------------------------------------------------------------
+
+static void test_attempt() {
+    constexpr auto p = pc::dsl::choice({
+        pc::dsl::seq({pc::dsl::symbol<"ab">(), pc::dsl::symbol<"c">()}).attempt(),
+        pc::dsl::seq({pc::dsl::symbol<"a">(), pc::dsl::symbol<"bd">()}),
+    });
+    // first alternative consumes "ab" then fails; attempt makes it backtrackable
+    auto ctx = pc::context();
+    auto r = pc::parser<p>::parse("abd", ctx);
+    CHECK(r.success);
+    CHECK(r.parsed.index() == 1);
+}
+
+// ---------------------------------------------------------------------------
+// chainl1 / chainr1
+// ---------------------------------------------------------------------------
+
+static void test_chain() {
+    constexpr auto number = pc::dsl::numeric().many1().recognize()
+        | pc::dsl::map<[](std::string_view s) { return std::stod(std::string(s)); }>;
+
+    constexpr auto plus = pc::dsl::char_<'+'>()
+        | pc::dsl::map<[](...) { return [](double a, double b) { return a + b; }; }>;
+    constexpr auto minus = pc::dsl::char_<'-'>()
+        | pc::dsl::map<[](...) { return [](double a, double b) { return a - b; }; }>;
+
+    constexpr auto add = pc::dsl::chainl1(number, plus);
+    constexpr auto sub = pc::dsl::chainl1(number, minus);
+    {
+        auto ctx = pc::context();
+        auto r = pc::parser<add>::parse("1+2+3", ctx);
+        CHECK(r.success);
+        CHECK(r.parsed == 6.0);
+    }
+    {
+        auto ctx = pc::context();
+        auto r = pc::parser<sub>::parse("10-3-2", ctx);
+        CHECK(r.success);
+        CHECK(r.parsed == 5.0); // left-associative: (10-3)-2
+    }
+
+    constexpr auto pow = pc::dsl::char_<'^'>()
+        | pc::dsl::map<[](...) { return [](double a, double b) { return std::pow(a, b); }; }>;
+    constexpr auto exp = pc::dsl::chainr1(number, pow);
+    {
+        auto ctx = pc::context();
+        auto r = pc::parser<exp>::parse("2^3^2", ctx);
+        CHECK(r.success);
+        CHECK(r.parsed == 512.0); // right-associative: 2^(3^2)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// hook application over the new combinators
+// ---------------------------------------------------------------------------
+
+constexpr auto hook_test_parser = pc::dsl::seq({
+    pc::dsl::numeric().many1().recognize().sep_by(pc::dsl::char_<','>()),
+    pc::dsl::eof(),
+});
+constexpr auto hook_test_hooked = pc::apply_hook<hook_test_parser>();
+
+static void test_apply_hook() {
+    auto ctx = pc::context();
+    auto r = pc::parser<hook_test_hooked>::parse("1,2", ctx);
+    CHECK(r.success);
+}
+
 int main() {
     test_primitives();
     test_seq_map_into();
@@ -309,6 +537,13 @@ int main() {
     test_cut_makes_failure_fatal();
     test_recursion();
     test_non_trivial_values();
+    test_satisfy_char_eof();
+    test_many1_count();
+    test_sep_by_between();
+    test_look_ahead_not();
+    test_attempt();
+    test_chain();
+    test_apply_hook();
 
     if (g_failures == 0) {
         std::println("all tests passed");

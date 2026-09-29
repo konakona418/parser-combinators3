@@ -34,6 +34,11 @@
 //      Sequence results are now generated aggregates (via define_aggregate)
 //      instead of std::tuple; choice results use a generated tagged union
 //      instead of std::variant.
+// 2026-09-29:
+//      Added the remaining standard combinators:
+//      satisfy/char_/any_char, many1, count<N>, sep_by/sep_by1, between,
+//      look_ahead, not_followed_by, attempt (inverse of cut),
+//      chainl1/chainr1, eof, and character predicates in `preds`.
 
 #pragma once
 
@@ -54,6 +59,7 @@
 #include <tuple>
 #include <type_traits>
 #include <utility>
+#include <variant>
 #include <vector>
 
 namespace parser_combinators {
@@ -523,6 +529,53 @@ namespace parser_combinators {
             }
         };
 
+        // the fundamental primitive: consume one character satisfying Predicate
+        template <auto Predicate>
+        struct satisfy_parser {
+            using value_type = char;
+            static auto parse(std::string_view input, parse_context& ctx) {
+                if (input.empty() || !Predicate(input[0])) {
+                    ctx.add_error("satisfy: predicate rejected input", input.data());
+                    return parse_failure<char>(input);
+                }
+                return parse_success<char>(input[0], input.substr(1));
+            }
+        };
+
+        template <char C>
+        struct char_parser {
+            using value_type = char;
+            static auto parse(std::string_view input, parse_context& ctx) {
+                if (input.empty() || input[0] != C) {
+                    ctx.add_error(std::string("Expected character: ") + C, input.data());
+                    return parse_failure<char>(input);
+                }
+                return parse_success<char>(input[0], input.substr(1));
+            }
+        };
+
+        struct any_char_parser {
+            using value_type = char;
+            static auto parse(std::string_view input, parse_context& ctx) {
+                if (input.empty()) {
+                    ctx.add_error("any_char: unexpected end of input", input.data());
+                    return parse_failure<char>(input);
+                }
+                return parse_success<char>(input[0], input.substr(1));
+            }
+        };
+
+        struct eof_parser {
+            using value_type = std::monostate;
+            static auto parse(std::string_view input, parse_context& ctx) {
+                if (!input.empty()) {
+                    ctx.add_error("eof: expected end of input", input.data());
+                    return parse_failure<std::monostate>(input);
+                }
+                return parse_success<std::monostate>(std::monostate{}, input);
+            }
+        };
+
         // ---------------------------------------------------------------------
         // combinators
         // ---------------------------------------------------------------------
@@ -647,6 +700,243 @@ namespace parser_combinators {
             }
         };
 
+        template <parser_trait BaseParser>
+        struct many1_parser {
+            using value_type = std::vector<typename BaseParser::value_type>;
+            static auto parse(std::string_view input, parse_context& ctx) {
+                using ElementType = typename BaseParser::value_type;
+
+                auto first = BaseParser::parse(input, ctx);
+                if (!first.success) {
+                    return parse_failure<value_type>(input, first.committed);
+                }
+
+                std::vector<ElementType> results;
+                results.push_back(std::move(first.parsed));
+                std::string_view remaining = first.remaining;
+                bool cut = first.committed;
+
+                while (true) {
+                    auto result = BaseParser::parse(remaining, ctx);
+                    if (result.success) {
+                        if (!consumed_since(remaining, result.remaining)) {
+                            ctx.add_error("many1: element parser succeeded without consuming input",
+                                          remaining.data());
+                            return parse_failure<value_type>(input, true);
+                        }
+                        if (result.committed) cut = true;
+                        results.push_back(std::move(result.parsed));
+                        remaining = result.remaining;
+                        continue;
+                    }
+                    if (result.committed) return parse_failure<value_type>(input, true);
+                    break;
+                }
+
+                return parse_success<value_type>(std::move(results), remaining, cut);
+            }
+        };
+
+        template <parser_trait BaseParser, std::size_t N>
+        struct count_parser {
+            using value_type = std::vector<typename BaseParser::value_type>;
+            static auto parse(std::string_view input, parse_context& ctx) {
+                using ElementType = typename BaseParser::value_type;
+
+                std::vector<ElementType> results;
+                results.reserve(N);
+                std::string_view remaining = input;
+                bool cut = false;
+
+                template for (constexpr auto i : std::define_static_array(make_index_array<N>())) {
+                    (void)i;
+                    auto result = BaseParser::parse(remaining, ctx);
+                    if (result.committed) cut = true;
+                    if (!result.success) {
+                        return parse_failure<value_type>(
+                            input, cut || consumed_since(input, remaining) || result.committed);
+                    }
+                    results.push_back(std::move(result.parsed));
+                    remaining = result.remaining;
+                }
+
+                return parse_success<value_type>(std::move(results), remaining, cut);
+            }
+        };
+
+        // AllowEmpty == true  -> sep_by  (zero or more)
+        // AllowEmpty == false -> sep_by1 (one or more)
+        template <parser_trait BaseParser, parser_trait SepParser, bool AllowEmpty>
+        struct sep_by_parser {
+            using value_type = std::vector<typename BaseParser::value_type>;
+            static auto parse(std::string_view input, parse_context& ctx) {
+                using ElementType = typename BaseParser::value_type;
+
+                std::vector<ElementType> results;
+                std::string_view remaining = input;
+                bool cut = false;
+
+                auto first = BaseParser::parse(remaining, ctx);
+                if (first.success) {
+                    cut = first.committed;
+                    results.push_back(std::move(first.parsed));
+                    remaining = first.remaining;
+                } else {
+                    if (first.committed) return parse_failure<value_type>(input, true);
+                    if constexpr (!AllowEmpty) return parse_failure<value_type>(input, first.committed);
+                    return parse_success<value_type>(std::move(results), remaining, false);
+                }
+
+                while (true) {
+                    auto sep = SepParser::parse(remaining, ctx);
+                    if (!sep.success) {
+                        if (sep.committed) return parse_failure<value_type>(input, true);
+                        break;
+                    }
+
+                    auto elem = BaseParser::parse(sep.remaining, ctx);
+                    if (!elem.success) {
+                        bool committed = cut || sep.committed || elem.committed ||
+                                         consumed_since(remaining, sep.remaining) ||
+                                         consumed_since(remaining, elem.remaining);
+                        return parse_failure<value_type>(input, committed);
+                    }
+                    if (!consumed_since(remaining, elem.remaining)) {
+                        ctx.add_error("sep_by: separator and element consumed no input",
+                                      remaining.data());
+                        return parse_failure<value_type>(input, true);
+                    }
+
+                    cut = cut || sep.committed || elem.committed;
+                    results.push_back(std::move(elem.parsed));
+                    remaining = elem.remaining;
+                }
+
+                return parse_success<value_type>(std::move(results), remaining, cut);
+            }
+        };
+
+        // run BaseParser but do not consume input on success
+        template <parser_trait BaseParser>
+        struct look_ahead_parser {
+            using value_type = typename BaseParser::value_type;
+            static constexpr bool yields_aggregate = parser_yields_aggregate<BaseParser>();
+            static auto parse(std::string_view input, parse_context& ctx) {
+                auto result = BaseParser::parse(input, ctx);
+                if (!result.success) {
+                    return parse_failure<typename BaseParser::value_type>(input, result.committed);
+                }
+                return parse_result<value_type>{true, result.committed, std::move(result.parsed), input};
+            }
+        };
+
+        // succeed (without consuming) iff BaseParser fails
+        template <parser_trait BaseParser>
+        struct not_parser {
+            using value_type = std::monostate;
+            static auto parse(std::string_view input, parse_context& ctx) {
+                auto result = BaseParser::parse(input, ctx);
+                if (result.success) {
+                    ctx.add_error("not_followed_by: unexpected match", input.data());
+                    return parse_failure<std::monostate>(input);
+                }
+                return parse_success<std::monostate>(std::monostate{}, input);
+            }
+        };
+
+        // turn a committed failure into an empty (backtrackable) one
+        template <parser_trait BaseParser>
+        struct attempt_parser {
+            using value_type = typename BaseParser::value_type;
+            static constexpr bool yields_aggregate = parser_yields_aggregate<BaseParser>();
+            static auto parse(std::string_view input, parse_context& ctx) {
+                auto result = BaseParser::parse(input, ctx);
+                if (!result.success) result.committed = false;
+                return result;
+            }
+        };
+
+        // left-associative: p (op p)* folded left
+        template <parser_trait Parser, parser_trait OpParser>
+        struct chainl1_parser {
+            using value_type = typename Parser::value_type;
+            static auto parse(std::string_view input, parse_context& ctx) {
+                using T = typename Parser::value_type;
+
+                auto first = Parser::parse(input, ctx);
+                if (!first.success) return parse_failure<T>(input, first.committed);
+
+                T acc = std::move(first.parsed);
+                std::string_view remaining = first.remaining;
+                bool cut = first.committed;
+
+                while (true) {
+                    auto op = OpParser::parse(remaining, ctx);
+                    if (!op.success) {
+                        if (op.committed) return parse_failure<T>(input, true);
+                        break;
+                    }
+                    auto rhs = Parser::parse(op.remaining, ctx);
+                    if (!rhs.success) {
+                        bool committed = cut || op.committed || rhs.committed ||
+                                         consumed_since(remaining, op.remaining) ||
+                                         consumed_since(remaining, rhs.remaining);
+                        return parse_failure<T>(input, committed);
+                    }
+                    cut = cut || op.committed || rhs.committed;
+                    acc = std::invoke(op.parsed, std::move(acc), std::move(rhs.parsed));
+                    remaining = rhs.remaining;
+                }
+
+                return parse_success<T>(std::move(acc), remaining, cut);
+            }
+        };
+
+        // right-associative: p (op p)* folded right
+        template <parser_trait Parser, parser_trait OpParser>
+        struct chainr1_parser {
+            using value_type = typename Parser::value_type;
+            static auto parse(std::string_view input, parse_context& ctx) {
+                using T = typename Parser::value_type;
+                using F = typename OpParser::value_type;
+
+                auto first = Parser::parse(input, ctx);
+                if (!first.success) return parse_failure<T>(input, first.committed);
+
+                std::vector<T> values;
+                std::vector<F> ops;
+                values.push_back(std::move(first.parsed));
+                std::string_view remaining = first.remaining;
+                bool cut = first.committed;
+
+                while (true) {
+                    auto op = OpParser::parse(remaining, ctx);
+                    if (!op.success) {
+                        if (op.committed) return parse_failure<T>(input, true);
+                        break;
+                    }
+                    auto rhs = Parser::parse(op.remaining, ctx);
+                    if (!rhs.success) {
+                        bool committed = cut || op.committed || rhs.committed ||
+                                         consumed_since(remaining, op.remaining) ||
+                                         consumed_since(remaining, rhs.remaining);
+                        return parse_failure<T>(input, committed);
+                    }
+                    cut = cut || op.committed || rhs.committed;
+                    ops.push_back(std::move(op.parsed));
+                    values.push_back(std::move(rhs.parsed));
+                    remaining = rhs.remaining;
+                }
+
+                T acc = std::move(values.back());
+                for (std::size_t i = ops.size(); i-- > 0; ) {
+                    acc = std::invoke(ops[i], std::move(values[i]), std::move(acc));
+                }
+
+                return parse_success<T>(std::move(acc), remaining, cut);
+            }
+        };
+
         template <string_literal Reason>
         struct invalid_parser {
             using value_type = std::string_view;
@@ -757,7 +1047,6 @@ namespace parser_combinators {
 
                 bool cut = false;
                 constexpr auto member_index_map = make_member_index_map<SubParsers...>();
-                constexpr auto subparser_infos = std::array<std::meta::info, sizeof...(SubParsers)>{^^SubParsers...};
                 template for (constexpr int i : std::define_static_array(make_index_array<sizeof...(SubParsers)>())) {
                     using SubParser = std::tuple_element_t<i, SubParsersTuple>;
                     auto r = SubParser::parse(parse_remaining, ctx);
@@ -846,6 +1135,61 @@ namespace parser_combinators {
                 return pw;
             }
 
+            // 1..n
+            consteval auto many1() const -> parser_wrapper {
+                parser_wrapper pw = *this;
+                pw.basic_parser = std::meta::substitute(^^many1_parser, {pw.basic_parser});
+                return pw;
+            }
+
+            // exactly N
+            template <std::size_t N>
+            consteval auto count() const -> parser_wrapper {
+                parser_wrapper pw = *this;
+                pw.basic_parser = std::meta::substitute(
+                    ^^count_parser, {pw.basic_parser, std::meta::reflect_constant(N)});
+                return pw;
+            }
+
+            // zero or more, separated by `sep`
+            consteval auto sep_by(parser_wrapper sep) const -> parser_wrapper {
+                parser_wrapper pw = *this;
+                pw.basic_parser = std::meta::substitute(
+                    ^^sep_by_parser,
+                    {pw.basic_parser, sep.basic_parser, std::meta::reflect_constant(true)});
+                return pw;
+            }
+
+            // one or more, separated by `sep`
+            consteval auto sep_by1(parser_wrapper sep) const -> parser_wrapper {
+                parser_wrapper pw = *this;
+                pw.basic_parser = std::meta::substitute(
+                    ^^sep_by_parser,
+                    {pw.basic_parser, sep.basic_parser, std::meta::reflect_constant(false)});
+                return pw;
+            }
+
+            // succeed without consuming input
+            consteval auto look_ahead() const -> parser_wrapper {
+                parser_wrapper pw = *this;
+                pw.basic_parser = std::meta::substitute(^^look_ahead_parser, {pw.basic_parser});
+                return pw;
+            }
+
+            // succeed without consuming input iff this parser fails
+            consteval auto not_followed_by() const -> parser_wrapper {
+                parser_wrapper pw = *this;
+                pw.basic_parser = std::meta::substitute(^^not_parser, {pw.basic_parser});
+                return pw;
+            }
+
+            // make failures backtrackable (inverse of cut)
+            consteval auto attempt() const -> parser_wrapper {
+                parser_wrapper pw = *this;
+                pw.basic_parser = std::meta::substitute(^^attempt_parser, {pw.basic_parser});
+                return pw;
+            }
+
             // recognize the raw input consumed by this parser (returns string_view)
             consteval auto recognize() const -> parser_wrapper {
                 parser_wrapper pw = *this;
@@ -878,11 +1222,12 @@ namespace parser_combinators {
             using value_type = OutType;
             static auto parse(std::string_view input, parse_context& ctx) -> parse_result<OutType> {
                 struct recurse_helper {
-                    using value_type = OutType;
+                    using value_type [[maybe_unused]] = OutType;
                     static auto parse(std::string_view input, parse_context& ctx) -> parse_result<OutType> {
                         return y_combinator<OutType, F>::parse(input, ctx);
                     }
                 };
+                static_assert(std::is_same_v<typename recurse_helper::value_type, OutType>);
 
                 static constexpr auto cached_parser = [] {
                     constexpr auto wrapper = F(parser_wrapper{^^recurse_helper});
@@ -962,6 +1307,28 @@ namespace parser_combinators {
             return detail::parser_wrapper{^^detail::whitespace_parser};
         }
 
+        template <auto Predicate>
+        consteval auto satisfy() {
+            auto parser_type = std::meta::substitute(
+                ^^detail::satisfy_parser, {std::meta::reflect_constant(Predicate)});
+            return detail::parser_wrapper{parser_type};
+        }
+
+        template <char C>
+        consteval auto char_() {
+            auto parser_type = std::meta::substitute(
+                ^^detail::char_parser, {std::meta::reflect_constant(C)});
+            return detail::parser_wrapper{parser_type};
+        }
+
+        consteval auto any_char() {
+            return detail::parser_wrapper{^^detail::any_char_parser};
+        }
+
+        consteval auto eof() {
+            return detail::parser_wrapper{^^detail::eof_parser};
+        }
+
         consteval auto seq(std::span<const detail::parser_wrapper> parsers) {
             std::vector<std::meta::info> parser_types;
             for (const auto& p : parsers) {
@@ -1024,6 +1391,40 @@ namespace parser_combinators {
                 parsers.push_back(Initializer.data[i]);
             }
             return choice(std::span{parsers.data(), parsers.size()});
+        }
+
+        // keep only the inner parser's value (drops the delimiters)
+        struct unwrap_fn {
+            template <typename T>
+            auto operator()(T&& value) const {
+                return std::forward<T>(value);
+            }
+        };
+
+        // open inner close, yielding inner's value
+        consteval auto between(detail::parser_wrapper open, detail::parser_wrapper close,
+                               detail::parser_wrapper inner) {
+            return seq({open.discard(), inner, close.discard()}).map<unwrap_fn{}>();
+        }
+
+        consteval auto sep_by(detail::parser_wrapper element, detail::parser_wrapper sep) {
+            return element.sep_by(sep);
+        }
+
+        consteval auto sep_by1(detail::parser_wrapper element, detail::parser_wrapper sep) {
+            return element.sep_by1(sep);
+        }
+
+        consteval auto chainl1(detail::parser_wrapper element, detail::parser_wrapper op) {
+            auto parser_type = std::meta::substitute(
+                ^^detail::chainl1_parser, {element.basic_parser, op.basic_parser});
+            return detail::parser_wrapper{parser_type};
+        }
+
+        consteval auto chainr1(detail::parser_wrapper element, detail::parser_wrapper op) {
+            auto parser_type = std::meta::substitute(
+                ^^detail::chainr1_parser, {element.basic_parser, op.basic_parser});
+            return detail::parser_wrapper{parser_type};
         }
 
         template <typename OutType, typename F>
@@ -1104,6 +1505,35 @@ namespace parser_combinators {
         constexpr auto not_empty = [](auto&& val) {
             return !val.empty();
         };
+
+        constexpr auto is_digit = [](char c) {
+            return c >= '0' && c <= '9';
+        };
+
+        constexpr auto is_alpha = [](char c) {
+            return std::isalpha(static_cast<unsigned char>(c)) != 0;
+        };
+
+        constexpr auto is_alphanumeric = [](char c) {
+            return std::isalnum(static_cast<unsigned char>(c)) != 0;
+        };
+
+        constexpr auto is_space = [](char c) {
+            return std::isspace(static_cast<unsigned char>(c)) != 0;
+        };
+
+        constexpr auto is_upper = [](char c) {
+            return c >= 'A' && c <= 'Z';
+        };
+
+        constexpr auto is_lower = [](char c) {
+            return c >= 'a' && c <= 'z';
+        };
+
+        template <char... Cs>
+        constexpr auto one_of = [](char c) {
+            return ((c == Cs) || ...);
+        };
     }
 
     constexpr auto context() {
@@ -1137,14 +1567,14 @@ namespace parser_combinators {
                 return pw;
             } else if constexpr (parser_template == ^^detail::sequential_parser ||
                                  parser_template == ^^detail::choice_parser) {
-                constexpr auto args = std::define_static_array(std::meta::template_arguments_of(parser_info));
+                static constexpr auto args = std::define_static_array(std::meta::template_arguments_of(parser_info));
                 std::vector<std::meta::info> new_args;
                 template for (constexpr auto arg : args) {
                     new_args.push_back(apply_hook<detail::parser_wrapper{arg}>().parser());
                 }
                 return detail::parser_wrapper{std::meta::substitute(parser_template, new_args)};
             } else if constexpr (parser_template == ^^detail::parser_decorator) {
-                constexpr auto args = std::define_static_array(std::meta::template_arguments_of(parser_info));
+                static constexpr auto args = std::define_static_array(std::meta::template_arguments_of(parser_info));
                 constexpr detail::parser_wrapper inner_pw{args[0]};
                 constexpr auto attr_info = args[1];
                 constexpr auto hooked_inner = apply_hook<inner_pw>();
@@ -1153,16 +1583,44 @@ namespace parser_combinators {
             } else if constexpr (parser_template == ^^detail::map_parser ||
                                  parser_template == ^^detail::optional_parser ||
                                  parser_template == ^^detail::many_parser ||
+                                 parser_template == ^^detail::many1_parser ||
+                                 parser_template == ^^detail::count_parser ||
                                  parser_template == ^^detail::label_parser ||
                                  parser_template == ^^detail::guard_parser ||
                                  parser_template == ^^detail::cut_parser ||
+                                 parser_template == ^^detail::attempt_parser ||
+                                 parser_template == ^^detail::look_ahead_parser ||
+                                 parser_template == ^^detail::not_parser ||
                                  parser_template == ^^detail::recognize_parser) {
-                constexpr auto args = std::define_static_array(std::meta::template_arguments_of(parser_info));
+                static constexpr auto args = std::define_static_array(std::meta::template_arguments_of(parser_info));
                 constexpr detail::parser_wrapper inner_pw{args[0]};
 
                 std::vector<std::meta::info> infos;
                 infos.push_back(apply_hook<inner_pw>().parser());
                 infos.insert(infos.end(), args.begin() + 1, args.end());
+
+                constexpr auto name = std::meta::display_string_of(parser_template);
+                constexpr auto name_size = name.size();
+                constexpr auto name_lit = detail::string_view_to_literal<name_size>(name.data());
+
+                return detail::parser_wrapper{std::meta::substitute(
+                    ^^detail::hooked_parser,
+                    {std::meta::reflect_constant(name_lit),
+                     std::meta::substitute(parser_template, infos)})};
+            } else if constexpr (parser_template == ^^detail::sep_by_parser ||
+                                 parser_template == ^^detail::chainl1_parser ||
+                                 parser_template == ^^detail::chainr1_parser) {
+                // both template arguments are parsers (plus an optional flag)
+                static constexpr auto args = std::define_static_array(std::meta::template_arguments_of(parser_info));
+                constexpr detail::parser_wrapper a0{args[0]};
+                constexpr detail::parser_wrapper a1{args[1]};
+
+                std::vector<std::meta::info> infos;
+                infos.push_back(apply_hook<a0>().parser());
+                infos.push_back(apply_hook<a1>().parser());
+                if constexpr (args.size() > 2) {
+                    infos.push_back(args[2]);
+                }
 
                 constexpr auto name = std::meta::display_string_of(parser_template);
                 constexpr auto name_size = name.size();

@@ -48,14 +48,37 @@ Requires GCC >= 16 (or the clang-p2996 fork) with `-std=c++26 -freflection`. The
 
 ## API
 
-Primitives: `symbol<"str">()`, `alpha()`, `numeric()`, `alphanumeric()`, `whitespace()`.
+Primitives: `symbol<"str">()`, `alpha()`, `numeric()`, `alphanumeric()`, `whitespace()`,
+`satisfy<Pred>()`, `char_<C>()`, `any_char()`, `eof()`.
 
-Combinators: `seq({...})`, `choice({...})`, `fix<Out>(f)` / `lazy<F>.fix<Out>()`, plus the
-member decorators `.map<F>()`, `.guard<Pred>()`, `.label<"msg">()`, `.cut()`, `.many()`,
-`.optional()`, `.discard()`, `.recognize()`.
+Combinators: `seq({...})`, `choice({...})`, `between(open, close, inner)`,
+`sep_by(p, sep)` / `sep_by1(p, sep)`, `chainl1(p, op)` / `chainr1(p, op)`,
+`fix<Out>(f)` / `lazy<F>.fix<Out>()`, plus the member decorators:
 
-Helpers: `dsl::into<T>`, `dsl::map<F>` / `dsl::guard<Pred>` (via `operator|`), `preds::not_empty`,
-and `.visit(...)` / `pc::visit(...)` for choice results.
+| method | meaning |
+|---|---|
+| `.map<F>()` | map the value (unpacks a `seq` aggregate into F's arguments) |
+| `.guard<Pred>()` | fail if `Pred(value)` is false |
+| `.label<"msg">()`, `.cut()` | error message / commit (no backtracking) |
+| `.attempt()` | inverse of `cut`: make failures backtrackable |
+| `.many()` / `.many1()` | 0..n / 1..n |
+| `.count<N>()` | exactly N |
+| `.optional()` | 0..1 |
+| `.sep_by(sep)` / `.sep_by1(sep)` | separated lists |
+| `.look_ahead()` | run without consuming |
+| `.not_followed_by()` | succeed iff this parser fails |
+| `.discard()` | drop the value from a `seq` result |
+| `.recognize()` | return the raw consumed `string_view` |
+
+Helpers: `dsl::into<T>` (build a struct from a `seq` result), `dsl::map<F>` / `dsl::guard<Pred>`
+(via `operator|`), predicates in `preds` (`not_empty`, `is_digit`, `is_alpha`, `is_alphanumeric`,
+`is_space`, `is_upper`, `is_lower`, `one_of<...>`), and `.visit(...)` / `pc::visit(...)` for
+choice results.
+
+> **Note on `bind`.** True monadic bind (`p >>= f` where `f` returns a parser chosen from the
+> *runtime* parsed value) is not expressible here: parsers are compile-time types and
+> `parser_wrapper` carries a `std::meta::info` that cannot exist at runtime. Use `satisfy`/`guard`
+> for value-dependent checks, or a fixed-arity runtime loop (e.g. `count` with a compile-time N).
 
 ## Examples
 

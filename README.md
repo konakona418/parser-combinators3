@@ -53,25 +53,27 @@ Primitives: `symbol<"str">()`, `alpha()`, `numeric()`, `alphanumeric()`, `whites
 
 Combinators: `seq({...})`, `choice({...})`, `between(open, close, inner)`,
 `sep_by(p, sep)` / `sep_by1(p, sep)`, `chainl1(p, op)` / `chainr1(p, op)`,
-`fix<Out>(f)` / `lazy<F>.fix<Out>()`, plus the member decorators:
+`fix<Out>(f)` for recursion, plus the member decorators:
 
 | method | meaning |
 |---|---|
-| `.map<F>()` | map the value (unpacks a `seq` aggregate into F's arguments) |
-| `.guard<Pred>()` | fail if `Pred(value)` is false |
+| `.map(f)` | map the value (unpacks a `seq` aggregate into `f`'s arguments) |
+| `.guard(pred)` | fail if `pred(value)` is false |
 | `.label<"msg">()`, `.cut()` | error message / commit (no backtracking) |
 | `.attempt()` | inverse of `cut`: make failures backtrackable |
 | `.many()` / `.many1()` | 0..n / 1..n |
 | `.count<N>()` | exactly N |
 | `.optional()` | 0..1 |
-| `.sep_by(sep)` / `.sep_by1(sep)` | separated lists |
 | `.look_ahead()` | run without consuming |
 | `.not_followed_by()` | succeed iff this parser fails |
 | `.discard()` | drop the value from a `seq` result |
 | `.recognize()` | return the raw consumed `string_view` |
 
-Helpers: `dsl::into<T>` (build a struct from a `seq` result), `dsl::map<F>` / `dsl::guard<Pred>`
-(via `operator|`), predicates in `preds` (`not_empty`, `is_digit`, `is_alpha`, `is_alphanumeric`,
+`map`/`guard` take the callable as a **value**; its type is captured statically, so it must be
+stateless and default-constructible (a captureless lambda, or `dsl::into<T>`). `.map(pc::dsl::into<T>)`
+builds `T` from the members of a `seq` result.
+
+Helpers: predicates in `preds` (`not_empty`, `is_digit`, `is_alpha`, `is_alphanumeric`,
 `is_space`, `is_upper`, `is_lower`, `one_of<...>`), and `.visit(...)` / `pc::visit(...)` for
 choice results.
 
@@ -94,127 +96,78 @@ struct ParserOut {
 };
 
 // parses an integer
-constexpr auto integer =
-    pc::dsl::numeric().many().recognize() // 0~9 -> raw string
-    | pc::dsl::guard<pc::preds::not_empty> // fail on empty strings
-    | pc::dsl::map<[](std::string_view s) { return std::stoi(std::string(s)); }>;
+constexpr auto digits = pc::dsl::numeric().many().recognize(); // 0~9 -> raw string
+constexpr auto integer = digits
+    .guard(pc::preds::not_empty) // fail on empty strings
+    .map([](std::string_view s) { return std::stoi(std::string(s)); });
 
 // use seq to parse a sequence
 constexpr auto parser = pc::dsl::seq<{
-        pc::dsl::symbol<"hello">().many().discard(), // many 'hello's, we just discard them
+        pc::dsl::symbol<"hello">().many().discard(), // many 'hello's, we discard them
         integer, // use a defined parser here
-        pc::dsl::symbol<"world">().label<"There should be a 'world' here">(), // verbose error message
+        pc::dsl::symbol<"world">().label<"There should be a 'world' here">(), // verbose error
         pc::dsl::choice({ // one of 'xyz' and 'abc'
             pc::dsl::symbol<"xyz">(),
             pc::dsl::symbol<"abc">(),
         }),
-    }>() | pc::dsl::map<pc::dsl::into<ParserOut>>; // fill the struct from the sequence
+    }>() // fill the struct from the sequence (members in declaration order)
+    .map(pc::dsl::into<ParserOut>);
 ```
 
-JSON parser. Full code in `json_parser_example.cpp`.
+A full RFC 8259 JSON parser is in `json_parser_example.cpp`. It is a genuine JSON grammar
+(whitespace is exactly space/tab/LF/CR, strings support `\uXXXX` escapes and reject raw control
+characters, numbers follow `-? int frac? exp?`, and the top level requires EOF). Sketch:
 
 ```cpp
 using pc = parser_combinators;
+namespace dsl = pc::dsl;
 
-// the main JSON parser
-// as JSON is recursive, we use a Y-combinator via dsl::lazy
-// and the recursive self (a detail::parser_wrapper) is passed as an argument to the lambda
-constexpr auto json_parser = pc::dsl::lazy<[](auto self) {
-    // parse JSON arrays
-    auto array = pc::dsl::seq({
-        lbracket.discard(),
-        sepby<comma>(self).optional(), // use optional to allow empty arrays
-        rbracket.discard(),
-    }) | pc::dsl::map<[](std::optional<json_array> opt) -> json_value {
-        return opt.value_or(json_array{});
-    }>;
+// skip exactly the four JSON whitespace characters
+constexpr auto ws0 = dsl::satisfy<[](char c) {
+    return c == ' ' || c == '\t' || c == '\n' || c == '\r';
+}>().many().discard();
 
-    // string and numeric literals
-    auto string_lit = pc::dsl::seq({
-        pc::dsl::symbol<"\"">().discard(),
-        pc::dsl::alphanumeric().many().recognize(),
-        pc::dsl::symbol<"\"">().discard(),
-    }) | pc::dsl::map<[](std::string_view s) -> json_value {
-        return std::string(s);
-    }>;
-
-    auto numeric_lit = pc::dsl::seq({
-        pc::dsl::numeric().many().recognize(),
-        pc::dsl::seq({
-            pc::dsl::symbol<".">().discard(), // decimal point
-            pc::dsl::numeric().many().recognize(),
-        }).optional(), // optional fractional part
-    }).recognize().guard<pc::preds::not_empty>() | pc::dsl::map<[](std::string_view s) -> json_value {
-        // recognize() ignores all underlying structures and produces a single string_view
-        // then guard ensures it's not empty, or it will break std::stod
-        return std::stod(std::string(s));
-    }>;
-
-    auto kwpair = pc::dsl::seq({
-        string_lit,
-        colon.cut().discard(), // cut to avoid backtracking after colon
-        self,
-    }) | pc::dsl::map<[](auto&& key_val, auto&& value) {
-        return std::make_pair(std::get<std::string>(key_val.data), value);
-    }>;
-
-    auto object = pc::dsl::seq({
-        lbrace.discard(),
-        sepby<comma>(kwpair).optional(),
-        rbrace.discard(),
-    }) | pc::dsl::map<[](std::optional<std::vector<std::pair<std::string, json_value>>> opt) -> json_value {
-        json_object obj;
-        if (opt) {
-            for (auto& p : *opt) obj.emplace(std::move(p));
-        }
-        return obj;
-    }>;
-
-    // finally, we use choice to combine all possible JSON value types
-    return pc::dsl::choice({
-        object,
-        array,
-        string_lit,
-        numeric_lit,
-        pc::dsl::symbol<"true">()  | pc::dsl::map<[](...) -> json_value { return true; }>,
-        pc::dsl::symbol<"false">() | pc::dsl::map<[](...) -> json_value { return false; }>,
-        pc::dsl::symbol<"null">()  | pc::dsl::map<[](...) -> json_value { return nullptr; }>,
-    }) | pc::dsl::map<[](auto&& v) -> json_value {
-        // choice() produces a generated tagged union (though all inner types are json_value)
-        // flatten it into json_value
-        return std::forward<decltype(v)>(v).visit([](auto&& inner_val) -> json_value {
-            return std::forward<decltype(inner_val)>(inner_val);
-        });
-    }>;
-}>.fix<json_value>();
-
-int main() {
-    // set up parse context with hook
-    hook_impl hook;
-    auto parse_context = pc::context();
-    parse_context.set_hook(&hook);
-
-    // apply hook to json_parser recursively
-    // however due to the Y-combinator, it will only apply to the outermost level
-    // to apply to all levels, it's best you define the parsers without Y-combinator first,
-    // apply_hook to that, then use dsl::lazy to wrap it into a Y-combinator
-    // but for demonstration purposes, this is sufficient
-    constexpr auto trace = pc::apply_hook<json_parser>();
-    auto str = R"({"key1": "value1", "key2": [true, false, null], "key3": {"nestedKey": 123.4, "anotherKey": [114, 514]}})";
-    auto result = pc::parser<trace>::parse(str, parse_context);
-
-    // check result
-    if (!result.success) {
-        // if failed, print error message and position
-        // note that the internal position is a pointer into the original input string
-        // use diff to get the offset
-        std::println("Parse failed: {}, pos={}", parse_context.error.message, parse_context.error.diff(str));
-        return 1;
-    }
-    std::println("Parse succeeded");
-
-    // print the parsed JSON value
-    walk_json(result.parsed);
-    return 0;
+consteval pc::parser_wrapper token(pc::parser_wrapper p) {
+    return dsl::seq({ws0, p, ws0}).map(dsl::unwrap_fn{});
 }
+
+// value = object / array / string / number / true / false / null
+constexpr auto json_parser = dsl::fix<json_value>([](auto self) {
+    auto value = token(self);
+
+    // number = [ "-" ] int [ frac ] [ exp ]
+    auto number = token(dsl::seq({
+        dsl::char_<'-'>().optional().discard(),
+        dsl::choice({
+            dsl::char_<'0'>(),
+            dsl::seq({dsl::satisfy<[](char c) { return c >= '1' && c <= '9'; }>(),
+                      dsl::numeric().many().discard()}),
+        }).discard(),
+        dsl::seq({dsl::char_<'.'>().discard(), dsl::numeric().many1().discard()})
+            .optional().discard(),
+        dsl::seq({dsl::satisfy<[](char c) { return c == 'e' || c == 'E'; }>().discard(),
+                  dsl::choice({dsl::char_<'+'>(), dsl::char_<'-'>()}).optional().discard(),
+                  dsl::numeric().many1().discard()})
+            .optional().discard(),
+    }).recognize()).map([](std::string_view raw) -> json_value {
+        double val = 0;
+        std::from_chars(raw.data(), raw.data() + raw.size(), val);
+        return val;
+    });
+
+    // ... string/object/array, then:
+    return dsl::choice({object, array, string_value, number, true_value, false_value, null_value})
+        .map([](auto&& v) -> json_value {
+            return std::forward<decltype(v)>(v).visit([](auto&& inner) -> json_value {
+                return std::forward<decltype(inner)>(inner);
+            });
+        });
+});
+
+// the whole input must be a single value
+constexpr auto json_text = dsl::seq({token(json_parser), dsl::eof().discard()})
+    .map([](json_value v) { return v; });
 ```
+
+See `json_parser_example.cpp` for the complete grammar, the escape decoder, and a tracing hook
+wired up via `pc::apply_hook`.

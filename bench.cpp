@@ -14,6 +14,7 @@
 #include <string_view>
 
 namespace pc = parser_combinators;
+namespace dsl = pc::dsl;
 
 struct json_value;
 using json_kv_pair = std::pair<std::string_view, json_value>;
@@ -50,39 +51,32 @@ struct json_value {
 // example JSON parser
 
 // lexeme parser that skips surrounding whitespace
-// P is a detail::parser_wrapper
+// P is a pc::parser_wrapper
 template <auto P>
-constexpr auto lexeme =
-    pc::dsl::seq<{
-        pc::dsl::whitespace().many().discard(), // skip zero or more whitespace
-        P,                                      // the parser P
-        pc::dsl::whitespace().many().discard(), // drop the result
-    }>();
+constexpr auto lexeme = dsl::seq({
+    dsl::whitespace().many().discard(), // skip zero or more whitespace
+    P,                                  // the parser P
+    dsl::whitespace().many().discard(), // drop the result
+});
 
 // symbol parsers for JSON syntax
-constexpr auto lparen = lexeme<pc::dsl::symbol<"(">()>;
-constexpr auto rparen = lexeme<pc::dsl::symbol<")">()>;
-constexpr auto lbracket = lexeme<pc::dsl::symbol<"[">()>;
-constexpr auto rbracket = lexeme<pc::dsl::symbol<"]">()>;
-constexpr auto lbrace = lexeme<pc::dsl::symbol<"{">()>;
-constexpr auto rbrace = lexeme<pc::dsl::symbol<"}">()>;
-constexpr auto colon = lexeme<pc::dsl::symbol<":">()>;
-constexpr auto comma = lexeme<pc::dsl::symbol<",">()>;
+constexpr auto lbracket = lexeme<dsl::symbol<"[" >()>;
+constexpr auto rbracket = lexeme<dsl::symbol<"]">()>;
+constexpr auto lbrace = lexeme<dsl::symbol<"{">()>;
+constexpr auto rbrace = lexeme<dsl::symbol<"}">()>;
+constexpr auto colon = lexeme<dsl::symbol<":">()>;
+constexpr auto comma = lexeme<dsl::symbol<",">()>;
 
 // helper parser to parse sequences separated by a specific separator
 template <auto Sep>
 consteval auto sepby(auto P) {
-    auto tail = (pc::dsl::seq({
-            Sep.discard(),
-            P,
-        }) | pc::dsl::map<[](auto&& element) {
-            return std::forward<decltype(element)>(element);
-        }>).many();
+    auto tail_base = dsl::seq({Sep.discard(), P});
+    auto tail = tail_base.map([](auto&& element) {
+        return std::forward<decltype(element)>(element);
+    }).many();
 
-    return pc::dsl::seq({
-        P,
-        tail,
-    }) | pc::dsl::map<[](auto&& first, auto&& rest) {
+    auto seq_base = dsl::seq({P, tail});
+    return seq_base.map([](auto&& first, auto&& rest) {
         using T = std::decay_t<decltype(first)>;
         std::vector<T> result;
         result.push_back(std::forward<decltype(first)>(first));
@@ -90,82 +84,90 @@ consteval auto sepby(auto P) {
             result.push_back(std::forward<decltype(val)>(val));
         }
         return result;
-    }>;
+    });
 };
 
 // the main JSON parser
-// as JSON is recursive, we use a Y-combinator via dsl::lazy
-constexpr auto json_parser = pc::dsl::lazy<[](auto self) {
+// as JSON is recursive, we use a Y-combinator via dsl::fix
+constexpr auto json_parser = dsl::fix<json_value>([](auto self) {
     // parse JSON arrays
-    auto array = pc::dsl::seq({
+    auto array_base = dsl::seq({
         lbracket.discard(),
         sepby<comma>(self).optional(),
         rbracket.discard(),
-    }) | pc::dsl::map<[](auto&& opt) -> json_value {
+    });
+    auto array = array_base.map([](auto&& opt) -> json_value {
         if (opt) {
             return json_value{std::move(*opt)};
         } else {
             return json_value{json_array{}};
         }
-    }>;
+    });
 
     // string and numeric literals
-    auto string_lit = pc::dsl::seq({
-        pc::dsl::symbol<"\"">().discard(),
-        pc::dsl::alphanumeric().many().recognize(),
-        pc::dsl::symbol<"\"">().discard(),
-    }) | pc::dsl::map<[](std::string_view s) -> json_value {
+    auto string_base = dsl::seq({
+        dsl::symbol<"\"">().discard(),
+        dsl::alphanumeric().many().recognize(),
+        dsl::symbol<"\"">().discard(),
+    });
+    auto string_lit = string_base.map([](std::string_view s) -> json_value {
         return s;
-    }>;
+    });
 
-    auto numeric_lit = pc::dsl::seq({
-        pc::dsl::symbol<"-">().optional().discard(), // optional minus sign
-        pc::dsl::numeric().many().recognize(),
-        pc::dsl::seq({
-            pc::dsl::symbol<".">().discard(), // decimal point
-            pc::dsl::numeric().many().recognize(),
+    auto number_base = dsl::seq({
+        dsl::symbol<"-">().optional().discard(), // optional minus sign
+        dsl::numeric().many().recognize(),
+        dsl::seq({
+            dsl::symbol<".">().discard(), // decimal point
+            dsl::numeric().many().recognize(),
         }).optional(), // optional fractional part
-    }).recognize().guard<pc::preds::not_empty>() | pc::dsl::map<[](std::string_view s) -> json_value {
-        double val;
-        std::from_chars(s.data(), s.data() + s.size(), val);
-        return val;
-    }>;
+    });
+    auto numeric_lit = number_base.recognize()
+        .guard(pc::preds::not_empty)
+        .map([](std::string_view s) -> json_value {
+            double val;
+            std::from_chars(s.data(), s.data() + s.size(), val);
+            return val;
+        });
 
-    auto kwpair = pc::dsl::seq({
+    auto member_base = dsl::seq({
         string_lit,
         colon.cut().discard(), // cut to avoid backtracking after colon
         self,
-    }) | pc::dsl::map<[](auto&& key_val, auto&& value) {
+    });
+    auto kwpair = member_base.map([](auto&& key_val, auto&& value) {
         return std::make_pair(key_val.data.template get<std::string_view>(), std::move(value));
-    }>;
+    });
 
-    auto object = pc::dsl::seq({
+    auto object_base = dsl::seq({
         lbrace.discard(),
         sepby<comma>(kwpair).optional(),
         rbrace.discard(),
-    }) | pc::dsl::map<[](auto&& opt) -> json_value {
+    });
+    auto object = object_base.map([](auto&& opt) -> json_value {
         if (opt) {
             return json_object{std::move(*opt)};
         } else {
             return json_object{};
         }
-    }>;
+    });
 
     // finally, we use choice to combine all possible JSON value types
-    return pc::dsl::choice({
+    auto choice_base = dsl::choice({
         object,
         array,
         string_lit,
         numeric_lit,
-        pc::dsl::symbol<"true">()  | pc::dsl::map<[](...) -> json_value { return true; }>,
-        pc::dsl::symbol<"false">() | pc::dsl::map<[](...) -> json_value { return false; }>,
-        pc::dsl::symbol<"null">()  | pc::dsl::map<[](...) -> json_value { return nullptr; }>,
-    }) | pc::dsl::map<[](auto&& v) -> json_value {
+        dsl::symbol<"true">().map([](...) -> json_value { return true; }),
+        dsl::symbol<"false">().map([](...) -> json_value { return false; }),
+        dsl::symbol<"null">().map([](...) -> json_value { return nullptr; }),
+    });
+    return choice_base.map([](auto&& v) -> json_value {
         return std::forward<decltype(v)>(v).visit([](auto&& inner_val) -> json_value {
             return std::move(inner_val);
         });
-    }>;
-}>.fix<json_value>();
+    });
+});
 
 std::string read_file_to_string(const std::string& filepath) {
     std::ifstream file(filepath, std::ios::binary);

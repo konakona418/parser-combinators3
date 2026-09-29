@@ -39,6 +39,16 @@
 //      satisfy/char_/any_char, many1, count<N>, sep_by/sep_by1, between,
 //      look_ahead, not_followed_by, attempt (inverse of cut),
 //      chainl1/chainr1, eof, and character predicates in `preds`.
+// 2026-09-29:
+//      Unified the public API: unary decorators are member methods, primitives
+//      and multi-parser combinators are free functions in `dsl`; removed the
+//      selective `operator|` sugar and `lazy` (recursion is now fix<Out>(f)).
+//      Rewrote the JSON example to conform to RFC 8259.
+// 2026-09-29:
+//      map/guard now take the callable as a value (`.map(f)` / `.guard(pred)`);
+//      its type is captured statically, so it must be stateless and
+//      default-constructible. This also avoids a GCC mis-parse of lambda
+//      template arguments placed right after a call/braced-init receiver.
 
 #pragma once
 
@@ -624,7 +634,7 @@ namespace parser_combinators {
             }
         };
 
-        template <parser_trait BaseParser, auto Predicate>
+        template <parser_trait BaseParser, typename Predicate>
         struct guard_parser {
             using value_type = typename BaseParser::value_type;
             static constexpr bool yields_aggregate = parser_yields_aggregate<BaseParser>();
@@ -633,7 +643,7 @@ namespace parser_combinators {
                 if (!r.success) {
                     return parse_failure<typename BaseParser::value_type>(input, r.committed);
                 }
-                if (!Predicate(r.parsed)) {
+                if (!Predicate{}(r.parsed)) {
                     bool committed = r.committed || consumed_since(input, r.remaining);
                     ctx.add_error("Guard condition failed", input.data());
                     return parse_failure<typename BaseParser::value_type>(input, committed);
@@ -980,15 +990,15 @@ namespace parser_combinators {
             return std::meta::substitute(^^generated_tuple_t, std::define_static_array(types));
         }
 
-        template <parser_trait BaseParser, auto Fmap>
+        template <parser_trait BaseParser, typename Fmap>
         struct map_parser {
             static constexpr bool is_aggregate = parser_yields_aggregate<BaseParser>();
 
             static auto apply(auto&& val) {
                 if constexpr (is_aggregate) {
-                    return apply_aggregate(Fmap, std::forward<decltype(val)>(val));
+                    return apply_aggregate(Fmap{}, std::forward<decltype(val)>(val));
                 } else {
-                    return std::invoke(Fmap, std::forward<decltype(val)>(val));
+                    return std::invoke(Fmap{}, std::forward<decltype(val)>(val));
                 }
             }
 
@@ -1108,11 +1118,11 @@ namespace parser_combinators {
                 return pw;
             }
 
-            template <auto Predicate>
-            consteval auto guard() const -> parser_wrapper {
+            template <typename Predicate>
+            consteval auto guard(Predicate) const -> parser_wrapper {
                 parser_wrapper pw = *this;
                 pw.basic_parser = std::meta::substitute(
-                    ^^guard_parser, {pw.basic_parser, std::meta::reflect_constant(Predicate)});
+                    ^^guard_parser, {pw.basic_parser, ^^Predicate});
                 return pw;
             }
 
@@ -1151,24 +1161,6 @@ namespace parser_combinators {
                 return pw;
             }
 
-            // zero or more, separated by `sep`
-            consteval auto sep_by(parser_wrapper sep) const -> parser_wrapper {
-                parser_wrapper pw = *this;
-                pw.basic_parser = std::meta::substitute(
-                    ^^sep_by_parser,
-                    {pw.basic_parser, sep.basic_parser, std::meta::reflect_constant(true)});
-                return pw;
-            }
-
-            // one or more, separated by `sep`
-            consteval auto sep_by1(parser_wrapper sep) const -> parser_wrapper {
-                parser_wrapper pw = *this;
-                pw.basic_parser = std::meta::substitute(
-                    ^^sep_by_parser,
-                    {pw.basic_parser, sep.basic_parser, std::meta::reflect_constant(false)});
-                return pw;
-            }
-
             // succeed without consuming input
             consteval auto look_ahead() const -> parser_wrapper {
                 parser_wrapper pw = *this;
@@ -1200,11 +1192,11 @@ namespace parser_combinators {
             }
 
             // map the parsed value (or, for a `seq`, unpack the generated aggregate)
-            template <auto Fmap>
-            consteval auto map() const -> parser_wrapper {
+            template <typename Fmap>
+            consteval auto map(Fmap) const -> parser_wrapper {
                 parser_wrapper pw = *this;
                 pw.basic_parser = std::meta::substitute(
-                    ^^map_parser, {pw.basic_parser, std::meta::reflect_constant(Fmap)});
+                    ^^map_parser, {pw.basic_parser, ^^Fmap});
                 return pw;
             }
 
@@ -1255,7 +1247,15 @@ namespace parser_combinators {
                     std::meta::extract<string_literal<symbol_name_size>>(symbol_name_constant);
                 constexpr auto symbol_str = "symbol_parser(\"" + std::string(symbol_name.str()) + "\")";
                 return string_view_to_literal<symbol_str.size()>(symbol_str.data());
-            } else if constexpr (Parser == ^^alpha_parser) return string_literal("alpha_parser");
+            } else if constexpr (std::meta::has_template_arguments(Parser) &&
+                                 std::meta::template_of(Parser) == ^^satisfy_parser) {
+                return string_literal("satisfy_parser");
+            } else if constexpr (std::meta::has_template_arguments(Parser) &&
+                                 std::meta::template_of(Parser) == ^^char_parser) {
+                return string_literal("char_parser");
+            } else if constexpr (Parser == ^^any_char_parser) return string_literal("any_char_parser");
+            else if constexpr (Parser == ^^eof_parser) return string_literal("eof_parser");
+            else if constexpr (Parser == ^^alpha_parser) return string_literal("alpha_parser");
             else if constexpr (Parser == ^^numeric_parser) return string_literal("numeric_parser");
             else if constexpr (Parser == ^^alphanumeric_parser) return string_literal("alphanumeric_parser");
             else if constexpr (Parser == ^^whitespace_parser) return string_literal("whitespace_parser");
@@ -1270,6 +1270,7 @@ namespace parser_combinators {
     using detail::parser_hook;
     using detail::parse_context;
     using detail::parse_error;
+    using detail::parser_wrapper;
     using detail::variant;
 
     template <typename V, typename F>
@@ -1404,15 +1405,21 @@ namespace parser_combinators {
         // open inner close, yielding inner's value
         consteval auto between(detail::parser_wrapper open, detail::parser_wrapper close,
                                detail::parser_wrapper inner) {
-            return seq({open.discard(), inner, close.discard()}).map<unwrap_fn{}>();
+            return seq({open.discard(), inner, close.discard()}).map(unwrap_fn{});
         }
 
         consteval auto sep_by(detail::parser_wrapper element, detail::parser_wrapper sep) {
-            return element.sep_by(sep);
+            auto parser_type = std::meta::substitute(
+                ^^detail::sep_by_parser,
+                {element.basic_parser, sep.basic_parser, std::meta::reflect_constant(true)});
+            return detail::parser_wrapper{parser_type};
         }
 
         consteval auto sep_by1(detail::parser_wrapper element, detail::parser_wrapper sep) {
-            return element.sep_by1(sep);
+            auto parser_type = std::meta::substitute(
+                ^^detail::sep_by_parser,
+                {element.basic_parser, sep.basic_parser, std::meta::reflect_constant(false)});
+            return detail::parser_wrapper{parser_type};
         }
 
         consteval auto chainl1(detail::parser_wrapper element, detail::parser_wrapper op) {
@@ -1433,41 +1440,6 @@ namespace parser_combinators {
                 ^^detail::y_combinator, {^^OutType, std::meta::reflect_constant(fn)});
             return detail::parser_wrapper{parser_type};
         }
-
-        template <auto F>
-        struct map_helper {};
-
-        template <auto F>
-        constexpr inline auto map = map_helper<F>{};
-
-        template <typename ParserWrapper, auto F>
-        consteval auto operator|(ParserWrapper pw, map_helper<F>) {
-            return pw.template map<F>();
-        }
-
-        template <auto P>
-        struct guard_helper {};
-
-        template <auto P>
-        constexpr inline auto guard = guard_helper<P>{};
-
-        template <typename ParserWrapper, auto P>
-        consteval auto operator|(ParserWrapper pw, guard_helper<P>) {
-            return pw.template guard<P>();
-        }
-
-        template <typename F>
-        struct lazy_helper {
-            F func;
-
-            template <typename OutType>
-            consteval auto fix() const {
-                return dsl::fix<OutType>(func);
-            }
-        };
-
-        template <auto F>
-        constexpr inline auto lazy = lazy_helper{F};
 
         // Build a struct/class OutType from the members of a `seq` result,
         // in declaration order.
@@ -1599,7 +1571,7 @@ namespace parser_combinators {
                 infos.push_back(apply_hook<inner_pw>().parser());
                 infos.insert(infos.end(), args.begin() + 1, args.end());
 
-                constexpr auto name = std::meta::display_string_of(parser_template);
+                constexpr auto name = std::meta::identifier_of(parser_template);
                 constexpr auto name_size = name.size();
                 constexpr auto name_lit = detail::string_view_to_literal<name_size>(name.data());
 
@@ -1622,7 +1594,7 @@ namespace parser_combinators {
                     infos.push_back(args[2]);
                 }
 
-                constexpr auto name = std::meta::display_string_of(parser_template);
+                constexpr auto name = std::meta::identifier_of(parser_template);
                 constexpr auto name_size = name.size();
                 constexpr auto name_lit = detail::string_view_to_literal<name_size>(name.data());
 

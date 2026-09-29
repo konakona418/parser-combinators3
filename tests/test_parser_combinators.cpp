@@ -2,6 +2,10 @@
 //
 // These are intentionally dependency-free: a tiny CHECK macro plus asserts.
 // Build with: cmake -S . -B build && cmake --build build && ctest --test-dir build
+//
+// Note: GCC 16 misparses an inline lambda used as a template argument directly
+// after a call/braced-init receiver, e.g. `seq({...}).map<[](auto...){...}>()`.
+// The tests therefore bind receivers to named variables first.
 
 #include "parser_combinators2.hpp"
 
@@ -12,6 +16,7 @@
 #include <string_view>
 
 namespace pc = parser_combinators;
+namespace dsl = pc::dsl;
 
 static int g_failures = 0;
 
@@ -28,7 +33,7 @@ static int g_failures = 0;
 // ---------------------------------------------------------------------------
 
 static void test_primitives() {
-    constexpr auto sym = pc::dsl::symbol<"hello">();
+    constexpr auto sym = dsl::symbol<"hello">();
     {
         auto ctx = pc::context();
         auto r = pc::parser<sym>::parse("hello world", ctx);
@@ -45,9 +50,9 @@ static void test_primitives() {
         CHECK(ctx.error.message.find("hello") != std::string::npos);
     }
 
-    constexpr auto a = pc::dsl::alpha();
-    constexpr auto d = pc::dsl::numeric();
-    constexpr auto w = pc::dsl::whitespace();
+    constexpr auto a = dsl::alpha();
+    constexpr auto d = dsl::numeric();
+    constexpr auto w = dsl::whitespace();
     {
         auto ctx = pc::context();
         CHECK(pc::parser<a>::parse("abc", ctx).success);
@@ -67,12 +72,13 @@ struct pair_out {
 };
 
 static void test_seq_map_into() {
-    // "42!" -> {42, "!"}
-    constexpr auto p = pc::dsl::seq({
-        pc::dsl::numeric().many().recognize()
-            | pc::dsl::map<[](std::string_view s) { return std::stoi(std::string(s)); }>,
-        pc::dsl::symbol<"!">(),
-    }) | pc::dsl::map<pc::dsl::into<pair_out>>;
+    constexpr auto int_part = dsl::numeric().many().recognize();
+    constexpr auto integer = int_part.map([](std::string_view s) {
+        return std::stoi(std::string(s));
+    });
+    constexpr auto bang = dsl::symbol<"!">();
+    constexpr auto seq_base = dsl::seq({integer, bang});
+    constexpr auto p = seq_base.map(dsl::into<pair_out>);
 
     auto ctx = pc::context();
     auto r = pc::parser<p>::parse("42!", ctx);
@@ -82,11 +88,12 @@ static void test_seq_map_into() {
 }
 
 static void test_recognize_keeps_consumed_text() {
-    constexpr auto p = pc::dsl::seq({
-        pc::dsl::symbol<"[">().discard(),
-        pc::dsl::numeric().many().discard(),
-        pc::dsl::symbol<"]">().discard(),
-    }).recognize();
+    constexpr auto seq_base = dsl::seq({
+        dsl::symbol<"[">().discard(),
+        dsl::numeric().many().discard(),
+        dsl::symbol<"]">().discard(),
+    });
+    constexpr auto p = seq_base.recognize();
 
     auto ctx = pc::context();
     auto r = pc::parser<p>::parse("[123]", ctx);
@@ -100,9 +107,9 @@ static void test_recognize_keeps_consumed_text() {
 // ---------------------------------------------------------------------------
 
 static void test_choice() {
-    constexpr auto p = pc::dsl::choice({
-        pc::dsl::symbol<"abc">(),
-        pc::dsl::symbol<"xyz">(),
+    constexpr auto p = dsl::choice({
+        dsl::symbol<"abc">(),
+        dsl::symbol<"xyz">(),
     });
 
     {
@@ -126,7 +133,7 @@ static void test_choice() {
 // ---------------------------------------------------------------------------
 
 static void test_optional_many() {
-    constexpr auto opt = pc::dsl::symbol<"a">().optional();
+    constexpr auto opt = dsl::symbol<"a">().optional();
     {
         auto ctx = pc::context();
         auto r = pc::parser<opt>::parse("bbb", ctx);
@@ -135,7 +142,7 @@ static void test_optional_many() {
         CHECK(!r.committed);
     }
 
-    constexpr auto digits = pc::dsl::numeric().many().recognize();
+    constexpr auto digits = dsl::numeric().many().recognize();
     {
         auto ctx = pc::context();
         auto r = pc::parser<digits>::parse("123abc", ctx);
@@ -157,7 +164,7 @@ static void test_optional_many() {
 // ---------------------------------------------------------------------------
 
 static void test_label() {
-    constexpr auto p = pc::dsl::symbol<"world">().label<"expected world">();
+    constexpr auto p = dsl::symbol<"world">().label<"expected world">();
     auto ctx = pc::context();
     auto r = pc::parser<p>::parse("nope", ctx);
     CHECK(!r.success);
@@ -165,9 +172,11 @@ static void test_label() {
 }
 
 static void test_guard() {
-    constexpr auto p = pc::dsl::numeric().many().recognize()
-        .guard<pc::preds::not_empty>()
-        | pc::dsl::map<[](std::string_view s) { return std::stoi(std::string(s)); }>;
+    constexpr auto digits = dsl::numeric().many().recognize();
+    constexpr auto guarded = digits.guard(pc::preds::not_empty);
+    constexpr auto p = guarded.map([](std::string_view s) {
+        return std::stoi(std::string(s));
+    });
 
     {
         auto ctx = pc::context();
@@ -190,12 +199,12 @@ static void test_guard() {
 
 // A: a zero-width success inside a sequence must not commit the sequence.
 static void test_zero_width_success_backtracks() {
-    constexpr auto p = pc::dsl::choice({
-        pc::dsl::seq({
-            pc::dsl::symbol<"a">().optional(),
-            pc::dsl::symbol<"x">(),
+    constexpr auto p = dsl::choice({
+        dsl::seq({
+            dsl::symbol<"a">().optional(),
+            dsl::symbol<"x">(),
         }),
-        pc::dsl::symbol<"b">(),
+        dsl::symbol<"b">(),
     });
     auto ctx = pc::context();
     auto r = pc::parser<p>::parse("b", ctx);
@@ -205,11 +214,11 @@ static void test_zero_width_success_backtracks() {
 
 // B: a committed failure inside a nested choice must propagate to the outer one.
 static void test_nested_committed_failure_propagates() {
-    constexpr auto p = pc::dsl::choice({
-        pc::dsl::choice({
-            pc::dsl::seq({pc::dsl::symbol<"a">(), pc::dsl::symbol<"x">()}),
+    constexpr auto p = dsl::choice({
+        dsl::choice({
+            dsl::seq({dsl::symbol<"a">(), dsl::symbol<"x">()}),
         }),
-        pc::dsl::symbol<"a">(),
+        dsl::symbol<"a">(),
     });
     auto ctx = pc::context();
     auto r = pc::parser<p>::parse("ab", ctx);
@@ -219,9 +228,10 @@ static void test_nested_committed_failure_propagates() {
 
 // C: many must propagate a committed failure instead of silently stopping.
 static void test_many_propagates_committed_failure() {
-    constexpr auto p = pc::dsl::choice({
-        pc::dsl::seq({pc::dsl::symbol<"a">(), pc::dsl::symbol<"x">()}).many(),
-        pc::dsl::seq({pc::dsl::symbol<"a">(), pc::dsl::symbol<"b">()}),
+    constexpr auto seq_fail = dsl::seq({dsl::symbol<"a">(), dsl::symbol<"x">()});
+    constexpr auto p = dsl::choice({
+        seq_fail.many(),
+        dsl::seq({dsl::symbol<"a">(), dsl::symbol<"b">()}),
     });
     auto ctx = pc::context();
     auto r = pc::parser<p>::parse("ab", ctx);
@@ -231,7 +241,7 @@ static void test_many_propagates_committed_failure() {
 
 // D: consuming input before failing makes the failure non-backtrackable.
 static void test_consumed_failure_is_committed() {
-    constexpr auto p = pc::dsl::seq({pc::dsl::symbol<"a">(), pc::dsl::symbol<"x">()});
+    constexpr auto p = dsl::seq({dsl::symbol<"a">(), dsl::symbol<"x">()});
     auto ctx = pc::context();
     auto r = pc::parser<p>::parse("ab", ctx);
     CHECK(!r.success);
@@ -240,9 +250,9 @@ static void test_consumed_failure_is_committed() {
 
 // E: cut makes an otherwise empty failure fatal.
 static void test_cut_makes_failure_fatal() {
-    constexpr auto with_cut = pc::dsl::choice({
-        pc::dsl::seq({pc::dsl::symbol<"a">().cut(), pc::dsl::symbol<"b">()}),
-        pc::dsl::symbol<"a">(),
+    constexpr auto with_cut = dsl::choice({
+        dsl::seq({dsl::symbol<"a">().cut(), dsl::symbol<"b">()}),
+        dsl::symbol<"a">(),
     });
     auto ctx = pc::context();
     auto r = pc::parser<with_cut>::parse("ac", ctx);
@@ -251,21 +261,25 @@ static void test_cut_makes_failure_fatal() {
 }
 
 // ---------------------------------------------------------------------------
-// recursion (Y-combinator)
+// recursion (Y-combinator) via dsl::fix
 // ---------------------------------------------------------------------------
 
-constexpr auto nested = pc::dsl::lazy<[](auto self) {
-    return pc::dsl::choice({
-        pc::dsl::seq({
-            pc::dsl::symbol<"(">().discard(),
-            self,
-            pc::dsl::symbol<")">().discard(),
-        }) | pc::dsl::map<[](auto depth) -> int { return depth + 1; }>,
-        pc::dsl::symbol<"x">() | pc::dsl::map<[](...) -> int { return 0; }>,
-    }) | pc::dsl::map<[](auto&& v) -> int {
+constexpr auto nested = dsl::fix<int>([](auto self) {
+    auto paren_base = dsl::seq({
+        dsl::char_<'('>().discard(),
+        self,
+        dsl::char_<')'>().discard(),
+    });
+    auto paren = paren_base.map([](auto depth) -> int { return depth + 1; });
+
+    auto x_base = dsl::char_<'x'>();
+    auto x = x_base.map([](...) -> int { return 0; });
+
+    auto options = dsl::choice({paren, x});
+    return options.map([](auto&& v) -> int {
         return std::forward<decltype(v)>(v).visit([](int depth) { return depth; });
-    }>;
-}>.fix<int>();
+    });
+});
 
 static void test_recursion() {
     auto parse_depth = [](std::string_view in) {
@@ -283,15 +297,17 @@ static void test_recursion() {
 // ---------------------------------------------------------------------------
 
 static void test_non_trivial_values() {
-    constexpr auto p = pc::dsl::seq({
-        pc::dsl::symbol<"a">() | pc::dsl::map<[](...) { return std::string("first"); }>,
-        pc::dsl::symbol<"b">() | pc::dsl::map<[](...) { return std::string("second"); }>,
+    constexpr auto a = dsl::symbol<"a">();
+    constexpr auto b = dsl::symbol<"b">();
+    constexpr auto p = dsl::seq({
+        a.map([](...) { return std::string("first"); }),
+        b.map([](...) { return std::string("second"); }),
     });
     auto ctx = pc::context();
     auto r = pc::parser<p>::parse("ab", ctx);
     CHECK(r.success);
     auto joined = pc::apply(
-        [](std::string a, std::string b) { return a + "+" + b; }, std::move(r.parsed));
+        [](std::string a_, std::string b_) { return a_ + "+" + b_; }, std::move(r.parsed));
     CHECK(joined == "first+second");
 }
 
@@ -300,7 +316,7 @@ static void test_non_trivial_values() {
 // ---------------------------------------------------------------------------
 
 static void test_satisfy_char_eof() {
-    constexpr auto vowel = pc::dsl::satisfy<[](char c) {
+    constexpr auto vowel = dsl::satisfy<[](char c) {
         return c == 'a' || c == 'e' || c == 'i' || c == 'o' || c == 'u';
     }>();
     {
@@ -312,25 +328,22 @@ static void test_satisfy_char_eof() {
     {
         auto ctx = pc::context();
         CHECK(!pc::parser<vowel>::parse("z", ctx).success);
-    }
-    {
-        auto ctx = pc::context();
-        CHECK(pc::parser<vowel>::parse("z", ctx).committed == false);
+        CHECK(!pc::parser<vowel>::parse("z", ctx).committed);
     }
 
-    constexpr auto x = pc::dsl::char_<'x'>();
+    constexpr auto x = dsl::char_<'x'>();
     {
         auto ctx = pc::context();
         CHECK(pc::parser<x>::parse("xyz", ctx).parsed == 'x');
     }
 
-    constexpr auto anyc = pc::dsl::any_char();
+    constexpr auto anyc = dsl::any_char();
     {
         auto ctx = pc::context();
         CHECK(pc::parser<anyc>::parse("Z", ctx).parsed == 'Z');
     }
 
-    constexpr auto end = pc::dsl::eof();
+    constexpr auto end = dsl::eof();
     {
         auto ctx = pc::context();
         CHECK(pc::parser<end>::parse("", ctx).success);
@@ -348,7 +361,7 @@ static void test_satisfy_char_eof() {
 // ---------------------------------------------------------------------------
 
 static void test_many1_count() {
-    constexpr auto digits = pc::dsl::numeric().many1().recognize();
+    constexpr auto digits = dsl::numeric().many1().recognize();
     {
         auto ctx = pc::context();
         auto r = pc::parser<digits>::parse("123a", ctx);
@@ -362,7 +375,8 @@ static void test_many1_count() {
         CHECK(!r.committed);
     }
 
-    constexpr auto three = pc::dsl::any_char().count<3>().recognize();
+    constexpr auto any3_base = dsl::any_char().count<3>();
+    constexpr auto three = any3_base.recognize();
     {
         auto ctx = pc::context();
         auto r = pc::parser<three>::parse("abcd", ctx);
@@ -382,8 +396,9 @@ static void test_many1_count() {
 // ---------------------------------------------------------------------------
 
 static void test_sep_by_between() {
-    constexpr auto comma = pc::dsl::char_<','>();
-    constexpr auto nums = pc::dsl::numeric().many1().recognize().sep_by(comma);
+    constexpr auto comma = dsl::char_<','>();
+    constexpr auto element = dsl::numeric().many1().recognize();
+    constexpr auto nums = dsl::sep_by(element, comma);
     {
         auto ctx = pc::context();
         auto r = pc::parser<nums>::parse("1,23,4", ctx);
@@ -408,14 +423,13 @@ static void test_sep_by_between() {
         CHECK(r.committed);
     }
 
-    constexpr auto nums1 = pc::dsl::numeric().many1().recognize().sep_by1(comma);
+    constexpr auto nums1 = dsl::sep_by1(element, comma);
     {
         auto ctx = pc::context();
         CHECK(!pc::parser<nums1>::parse("", ctx).success);
     }
 
-    constexpr auto bracketed =
-        pc::dsl::between(pc::dsl::char_<'['>(), pc::dsl::char_<']'>(), nums);
+    constexpr auto bracketed = dsl::between(dsl::char_<'['>(), dsl::char_<']'>(), nums);
     {
         auto ctx = pc::context();
         auto r = pc::parser<bracketed>::parse("[1,2]", ctx);
@@ -430,7 +444,7 @@ static void test_sep_by_between() {
 // ---------------------------------------------------------------------------
 
 static void test_look_ahead_not() {
-    constexpr auto la = pc::dsl::symbol<"ab">().look_ahead();
+    constexpr auto la = dsl::symbol<"ab">().look_ahead();
     {
         auto ctx = pc::context();
         auto r = pc::parser<la>::parse("abc", ctx);
@@ -438,7 +452,7 @@ static void test_look_ahead_not() {
         CHECK(r.remaining == "abc"); // nothing consumed
     }
 
-    constexpr auto not_x = pc::dsl::char_<'x'>().not_followed_by();
+    constexpr auto not_x = dsl::char_<'x'>().not_followed_by();
     {
         auto ctx = pc::context();
         auto r = pc::parser<not_x>::parse("y", ctx);
@@ -456,9 +470,9 @@ static void test_look_ahead_not() {
 // ---------------------------------------------------------------------------
 
 static void test_attempt() {
-    constexpr auto p = pc::dsl::choice({
-        pc::dsl::seq({pc::dsl::symbol<"ab">(), pc::dsl::symbol<"c">()}).attempt(),
-        pc::dsl::seq({pc::dsl::symbol<"a">(), pc::dsl::symbol<"bd">()}),
+    constexpr auto p = dsl::choice({
+        dsl::seq({dsl::symbol<"ab">(), dsl::symbol<"c">()}).attempt(),
+        dsl::seq({dsl::symbol<"a">(), dsl::symbol<"bd">()}),
     });
     // first alternative consumes "ab" then fails; attempt makes it backtrackable
     auto ctx = pc::context();
@@ -472,16 +486,22 @@ static void test_attempt() {
 // ---------------------------------------------------------------------------
 
 static void test_chain() {
-    constexpr auto number = pc::dsl::numeric().many1().recognize()
-        | pc::dsl::map<[](std::string_view s) { return std::stod(std::string(s)); }>;
+    constexpr auto number_base = dsl::numeric().many1().recognize();
+    constexpr auto number = number_base.map([](std::string_view s) {
+        return std::stod(std::string(s));
+    });
 
-    constexpr auto plus = pc::dsl::char_<'+'>()
-        | pc::dsl::map<[](...) { return [](double a, double b) { return a + b; }; }>;
-    constexpr auto minus = pc::dsl::char_<'-'>()
-        | pc::dsl::map<[](...) { return [](double a, double b) { return a - b; }; }>;
+    constexpr auto plus_char = dsl::char_<'+'>();
+    constexpr auto plus = plus_char.map([](...) {
+        return [](double a, double b) { return a + b; };
+    });
+    constexpr auto minus_char = dsl::char_<'-'>();
+    constexpr auto minus = minus_char.map([](...) {
+        return [](double a, double b) { return a - b; };
+    });
 
-    constexpr auto add = pc::dsl::chainl1(number, plus);
-    constexpr auto sub = pc::dsl::chainl1(number, minus);
+    constexpr auto add = dsl::chainl1(number, plus);
+    constexpr auto sub = dsl::chainl1(number, minus);
     {
         auto ctx = pc::context();
         auto r = pc::parser<add>::parse("1+2+3", ctx);
@@ -495,9 +515,11 @@ static void test_chain() {
         CHECK(r.parsed == 5.0); // left-associative: (10-3)-2
     }
 
-    constexpr auto pow = pc::dsl::char_<'^'>()
-        | pc::dsl::map<[](...) { return [](double a, double b) { return std::pow(a, b); }; }>;
-    constexpr auto exp = pc::dsl::chainr1(number, pow);
+    constexpr auto pow_char = dsl::char_<'^'>();
+    constexpr auto pow_op = pow_char.map([](...) {
+        return [](double a, double b) { return std::pow(a, b); };
+    });
+    constexpr auto exp = dsl::chainr1(number, pow_op);
     {
         auto ctx = pc::context();
         auto r = pc::parser<exp>::parse("2^3^2", ctx);
@@ -510,9 +532,10 @@ static void test_chain() {
 // hook application over the new combinators
 // ---------------------------------------------------------------------------
 
-constexpr auto hook_test_parser = pc::dsl::seq({
-    pc::dsl::numeric().many1().recognize().sep_by(pc::dsl::char_<','>()),
-    pc::dsl::eof(),
+constexpr auto hook_element = dsl::numeric().many1().recognize().guard(pc::preds::not_empty);
+constexpr auto hook_test_parser = dsl::seq({
+    dsl::sep_by(hook_element, dsl::char_<','>()),
+    dsl::eof(),
 });
 constexpr auto hook_test_hooked = pc::apply_hook<hook_test_parser>();
 
